@@ -1,146 +1,179 @@
-import os
 import pandas as pd
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+import os
+from dash import Dash, dcc, html, Input, Output
 
 FILE_NAME = 'MLBData2024.csv'
 
-def load_and_clean_data(file_path):
-    print("📂 Attempting to load data...")
+# Strike zone boundaries (approximate, feet)
+LEFT, RIGHT = -0.7083, 0.7083
+BOTTOM, TOP = 1.5, 3.5
 
-    if not os.path.exists(file_path):
-        print(f"❌ File not found: {file_path}")
-        return pd.DataFrame()
+def assign_zone(row):
+    x, z = row['plate_x'], row['plate_z']
+    if pd.isna(x) or pd.isna(z):
+        return -1  # invalid zone
 
-    try:
-        if file_path.endswith('.csv'):
-            df = pd.read_csv(file_path)
-        elif file_path.endswith('.xlsx') or file_path.endswith('.xls'):
-            df = pd.read_excel(file_path)
-        else:
-            print(f"❌ Unsupported file format: {file_path}")
-            return pd.DataFrame()
-    except Exception as e:
-        print(f"❌ Error reading the file: {e}")
-        return pd.DataFrame()
+    if x < LEFT or x > RIGHT or z < BOTTOM or z > TOP:
+        return 0  # outside zone
 
-    print(f"✅ Successfully loaded {len(df)} rows.")
+    x_bins = [LEFT, LEFT + (RIGHT - LEFT)/3, LEFT + 2*(RIGHT - LEFT)/3, RIGHT]
+    z_bins = [BOTTOM, BOTTOM + (TOP - BOTTOM)/3, BOTTOM + 2*(TOP - BOTTOM)/3, TOP]
 
-    df.columns = df.columns.str.strip()
-
-    # Check critical columns, drop rows with NaNs in those
-    critical_cols = ['plate_x', 'plate_z', 'player_name', 'events']
-    existing_critical_cols = [col for col in critical_cols if col in df.columns]
-
-    if existing_critical_cols:
-        df = df.dropna(subset=existing_critical_cols)
+    if x <= x_bins[1]:
+        col = 1
+    elif x <= x_bins[2]:
+        col = 2
     else:
-        print("⚠️ None of the critical columns for filtering found. Skipping dropna step.")
+        col = 3
 
-    useful_cols = [
-        'player_name', 'plate_x', 'plate_z', 'zone', 'events',
-        'estimated_ba_using_speedangle', 'game_date', 'launch_speed',
-        'launch_angle', 'description'
-    ]
-    df = df[[col for col in useful_cols if col in df.columns]]
+    if z <= z_bins[1]:
+        row_num = 1
+    elif z <= z_bins[2]:
+        row_num = 2
+    else:
+        row_num = 3
 
-    print(f"🧹 Cleaned data has {len(df)} rows and {len(df.columns)} columns.")
+    zone = (row_num - 1)*3 + col
+    return zone
+
+def load_and_prepare_data(filename):
+    if not os.path.exists(filename):
+        raise FileNotFoundError(f"Data file {filename} not found.")
+    print("📂 Loading data...")
+    df = pd.read_csv(filename)
+    print(f"✅ Loaded {len(df)} rows.")
+
+    critical_cols = ['player_name', 'plate_x', 'plate_z', 'ba', 'xba']
+    df = df.dropna(subset=critical_cols)
+
+    df['zone'] = df.apply(assign_zone, axis=1)
+    df = df[df['zone'] >= 0]
+    print(f"🧹 Data cleaned to {len(df)} rows with valid zones.")
     return df
 
-def build_strike_zone_grid(ax):
-    # strikezone boundaries
-    left, right = -0.7083, 0.7083  # horizontal limits (feet)
-    bottom, top = 1.5, 3.5          # vertical limits (feet)
-    
-    # Draw outer big strike zone rectangle (bold black)
-    ax.plot([left, right, right, left, left],
-            [bottom, bottom, top, top, bottom],
-            color='black', linewidth=2)
+def aggregate_player_stats(df):
+    agg = df.groupby(['player_name', 'zone']).agg(
+        avg_ba=pd.NamedAgg(column='ba', aggfunc='mean'),
+        avg_xba=pd.NamedAgg(column='xba', aggfunc='mean'),
+        count=pd.NamedAgg(column='ba', aggfunc='count')
+    ).reset_index()
+    return agg
 
-    # Draw 3x3 grid inside strike zone (lighter lines)
-    x_ticks = [left, (left+right)/3, (left+right)*2/3, right]
-    y_ticks = [bottom, (bottom+top)/3, (bottom+top)*2/3, top]
+def create_strikezone_figure(df_agg, selected_player):
+    zone_centers = {
+        1: (LEFT + (RIGHT - LEFT)/6, BOTTOM + (TOP - BOTTOM)/6),
+        2: (LEFT + (RIGHT - LEFT)/2, BOTTOM + (TOP - BOTTOM)/6),
+        3: (LEFT + 5*(RIGHT - LEFT)/6, BOTTOM + (TOP - BOTTOM)/6),
+        4: (LEFT + (RIGHT - LEFT)/6, BOTTOM + (TOP - BOTTOM)/2),
+        5: (LEFT + (RIGHT - LEFT)/2, BOTTOM + (TOP - BOTTOM)/2),
+        6: (LEFT + 5*(RIGHT - LEFT)/6, BOTTOM + (TOP - BOTTOM)/2),
+        7: (LEFT + (RIGHT - LEFT)/6, BOTTOM + 5*(TOP - BOTTOM)/6),
+        8: (LEFT + (RIGHT - LEFT)/2, BOTTOM + 5*(TOP - BOTTOM)/6),
+        9: (LEFT + 5*(RIGHT - LEFT)/6, BOTTOM + 5*(TOP - BOTTOM)/6),
+        0: (RIGHT + 0.3, BOTTOM),  # Outside zone
+    }
 
-    for x in x_ticks:
-        ax.plot([x, x], [bottom, top], color='gray', linestyle='--', linewidth=0.8)
-    for y in y_ticks:
-        ax.plot([left, right], [y, y], color='gray', linestyle='--', linewidth=0.8)
+    fig = go.Figure()
 
-    # Draw outer 9 "outside" zones (lighter grid around the strike zone)
-    # Extend grid by same width/height beyond main strike zone edges
-    width = right - left
-    height = top - bottom
+    # Strike zone rectangle
+    fig.add_shape(type="rect",
+                  x0=LEFT, y0=BOTTOM, x1=RIGHT, y1=TOP,
+                  line=dict(color="black", width=3))
 
-    # Horizontal grid lines above and below
-    for y in [bottom - height/3, bottom - 2*height/3, top + height/3, top + 2*height/3]:
-        ax.plot([left - width, right + width], [y, y], color='lightgray', linestyle=':', linewidth=0.6)
+    # Grid lines (lighter)
+    for x in [LEFT + (RIGHT - LEFT)/3, LEFT + 2*(RIGHT - LEFT)/3]:
+        fig.add_shape(type="line",
+                      x0=x, y0=BOTTOM, x1=x, y1=TOP,
+                      line=dict(color="gray", width=1, dash="dash"))
+    for y in [BOTTOM + (TOP - BOTTOM)/3, BOTTOM + 2*(TOP - BOTTOM)/3]:
+        fig.add_shape(type="line",
+                      x0=LEFT, y0=y, x1=RIGHT, y1=y,
+                      line=dict(color="gray", width=1, dash="dash"))
 
-    # Vertical grid lines left and right
-    for x in [left - width/3, left - 2*width/3, right + width/3, right + 2*width/3]:
-        ax.plot([x, x], [bottom - height, top + height], color='lightgray', linestyle=':', linewidth=0.6)
+    player_data = df_agg[df_agg['player_name'] == selected_player]
 
-    # Outer big square boundary for outside zones (lighter)
-    ax.plot([left - width, right + width, right + width, left - width, left - width],
-            [bottom - height, bottom - height, top + height, top + height, bottom - height],
-            color='lightgray', linewidth=1)
+    x_vals_avg, y_vals_avg, text_avg = [], [], []
+    x_vals_xba, y_vals_xba, text_xba = [], [], []
 
-    # Set equal aspect ratio and limits to fit all zones
-    ax.set_aspect('equal', 'box')
-    ax.set_xlim(left - width, right + width)
-    ax.set_ylim(bottom - height, top + height)
+    for zone, center in zone_centers.items():
+        stats = player_data[player_data['zone'] == zone]
+        if not stats.empty:
+            avg_ba = stats['avg_ba'].values[0]
+            avg_xba = stats['avg_xba'].values[0]
+            count = stats['count'].values[0]
+            text_avg.append(f"AVG: {avg_ba:.3f}<br>Pitches: {count}")
+            text_xba.append(f"xAVG: {avg_xba:.3f}")
+        else:
+            text_avg.append("")
+            text_xba.append("")
 
-    ax.set_xlabel("Horizontal Location (feet)")
-    ax.set_ylabel("Vertical Location (feet)")
-    ax.set_title("2024 MLB Plate Discipline: Aaron Judge")
+        x_vals_avg.append(center[0])
+        y_vals_avg.append(center[1] + 0.05)
+        x_vals_xba.append(center[0])
+        y_vals_xba.append(center[1] - 0.05)
 
-    # Remove axis ticks (optional)
-    ax.set_xticks([])
-    ax.set_yticks([])
+    # AVG trace
+    fig.add_trace(go.Scatter(
+        x=x_vals_avg, y=y_vals_avg,
+        mode='text',
+        text=text_avg,
+        textfont=dict(color='blue', size=14),
+        name="AVG",
+        hoverinfo='text',
+        hovertext=text_avg
+    ))
 
-def calculate_zone_stats(df, player_name):
-    # Filter for this player and valid hits/events
-    player_df = df[df['player_name'] == player_name].copy()
+    # xAVG trace
+    fig.add_trace(go.Scatter(
+        x=x_vals_xba, y=y_vals_xba,
+        mode='text',
+        text=text_xba,
+        textfont=dict(color='red', size=14),
+        name="xAVG",
+        hoverinfo='text',
+        hovertext=text_xba
+    ))
 
-    if player_df.empty:
-        print(f"⚠️ No data for player {player_name}")
-        return {}
+    fig.update_layout(
+        title="Interactive Plate Discipline: Offensive Analysis",
+        xaxis=dict(range=[LEFT - 0.5, RIGHT + 1.5], zeroline=False, showgrid=False, showticklabels=False),
+        yaxis=dict(range=[BOTTOM - 0.5, TOP + 0.5], zeroline=False, showgrid=False, showticklabels=False),
+        height=700,
+        width=600,
+        margin=dict(t=80)
+    )
 
-    # Zones are integers from 1 to 9 inside the strike zone
-    # Outside zones can be 10 to 18 (if 'zone' column follows Baseball Savant convention)
-    # We'll calculate AVG and xAVG for each zone from 1 to 18
+    return fig
 
-    zone_stats = {}
+def main():
+    df = load_and_prepare_data(FILE_NAME)
+    df_agg = aggregate_player_stats(df)
+    players = sorted(df_agg['player_name'].unique())
 
-    # Check if 'zone' and 'estimated_ba_using_speedangle' exist
-    if 'zone' not in player_df.columns or 'estimated_ba_using_speedangle' not in player_df.columns:
-        print("⚠️ Missing 'zone' or 'estimated_ba_using_speedangle' columns for calculation")
-        return {}
+    app = Dash(__name__)
 
-    for zone_num in range(1, 19):
-        zone_data = player_df[player_df['zone'] == zone_num]
+    app.layout = html.Div([
+        html.H1("Interactive Plate Discipline: Offensive Analysis", style={'textAlign': 'center'}),
+        dcc.Dropdown(
+            id='player-dropdown',
+            options=[{'label': p, 'value': p} for p in players],
+            value="Judge, Aaron",
+            searchable=True,
+            clearable=False,
+            style={'width': '50%', 'margin': 'auto'}
+        ),
+        dcc.Graph(id='strikezone-graph')
+    ])
 
-        if zone_data.empty:
-            zone_stats[zone_num] = {'AVG': None, 'xAVG': None, 'count': 0}
-            continue
+    @app.callback(
+        Output('strikezone-graph', 'figure'),
+        Input('player-dropdown', 'value')
+    )
+    def update_figure(selected_player):
+        return create_strikezone_figure(df_agg, selected_player)
 
-        # Calculate batting average: hits / at-bats (approximate with events)
-        # We'll approximate hits by counting rows where events is a hit event
+    app.run(debug=True)
 
-        # Define hit events for simplicity
-        hits_events = ['single', 'double', 'triple', 'home_run']
-
-        hits = zone_data['events'].str.lower().isin(hits_events).sum()
-        at_bats = len(zone_data)
-
-        avg = hits / at_bats if at_bats > 0 else None
-        xavg = zone_data['estimated_ba_using_speedangle'].mean() if 'estimated_ba_using_speedangle' in zone_data else None
-
-        zone_stats[zone_num] = {'AVG': avg, 'xAVG': xavg, 'count': at_bats}
-
-    return zone_stats
-
-def plot_zone_stats(zone_stats):
-    fig, ax = plt.subplots(figsize=(8, 10))
-    build_strike_zone_grid(ax)
-
-    # Mapping zones 1-9 inside strike zone, 10-18 outside zones
-    # Position zo
+if __name__ == "__main__":
+    main()
